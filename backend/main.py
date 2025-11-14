@@ -11,6 +11,7 @@ from typing import List, Dict, Any
 from pydantic import BaseModel
 import time
 from functools import lru_cache
+import asyncio
 
 app = FastAPI()
 
@@ -27,6 +28,10 @@ def init_database():
     """初始化SQLite数据库"""
     conn = sqlite3.connect('stocks.db')
     cursor = conn.cursor()
+    try:
+        cursor.execute('PRAGMA journal_mode=WAL;')
+    except:
+        pass
     
     # 创建股票信息表
     cursor.execute('''
@@ -54,6 +59,19 @@ def init_database():
         expires_at TIMESTAMP NOT NULL
     )
     ''')
+
+    # 创建日线行情缓存表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS price_cache (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        stock_code TEXT UNIQUE NOT NULL,
+        rows TEXT NOT NULL,
+        period TEXT DEFAULT 'daily',
+        adjust TEXT DEFAULT 'qfq',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP NOT NULL
+    )
+    ''')
     
     # 创建错误日志表
     cursor.execute('''
@@ -66,6 +84,13 @@ def init_database():
     )
     ''')
     
+    try:
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_fundamental_expires ON fundamental_cache(expires_at);')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_stocks_code ON stocks(stock_code);')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_price_expires ON price_cache(expires_at);')
+    except:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -79,17 +104,20 @@ def save_fundamental_cache(stock_code: str, data: dict, expires_hours: int = 24)
         from datetime import datetime, timedelta
         expires_at = (datetime.now() + timedelta(hours=expires_hours)).isoformat()
         
-        cursor.execute('''
+        try:
+            cursor.execute('''
         INSERT OR REPLACE INTO fundamental_cache 
         (stock_code, data, data_source, updated_at, expires_at)
         VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
         ''', (
             stock_code,
-            json.dumps(data, ensure_ascii=False),
+            json.dumps(data, ensure_ascii=False, default=str),
             data.get('data_source', 'unknown'),
             expires_at
         ))
-        conn.commit()
+            conn.commit()
+        except Exception:
+            pass
     finally:
         conn.close()
 
@@ -110,6 +138,39 @@ def get_fundamental_cache(stock_code: str):
             data['cache_source'] = result[1]
             data['cache_hit'] = True
             return data
+        return None
+    finally:
+        conn.close()
+
+def save_price_cache(stock_code: str, rows: List[Dict[str, Any]], expires_hours: int = 6, period: str = 'daily', adjust: str = 'qfq'):
+    conn = sqlite3.connect('stocks.db')
+    cursor = conn.cursor()
+    try:
+        expires_at = (datetime.now() + timedelta(hours=expires_hours)).isoformat()
+        try:
+            cursor.execute('''
+        INSERT OR REPLACE INTO price_cache (stock_code, rows, period, adjust, updated_at, expires_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+        ''', (stock_code, json.dumps(rows, ensure_ascii=False, default=str), period, adjust, expires_at))
+            conn.commit()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+def get_price_cache(stock_code: str):
+    conn = sqlite3.connect('stocks.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+        SELECT rows FROM price_cache WHERE stock_code = ? AND expires_at > CURRENT_TIMESTAMP
+        ''', (stock_code,))
+        result = cursor.fetchone()
+        if result:
+            try:
+                return json.loads(result[0])
+            except:
+                return None
         return None
     finally:
         conn.close()
@@ -158,7 +219,7 @@ def save_stock_to_db(stock_data: dict):
             stock_data['stock_name'],
             stock_data.get('added_time', datetime.now().isoformat()),
             stock_data.get('highlight', False),
-            json.dumps(stock_data.get('strategies', {}))
+            json.dumps(stock_data.get('strategies', {}), ensure_ascii=False, default=str)
         ))
         conn.commit()
     finally:
@@ -210,6 +271,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def on_startup():
+    init_database()
+    clean_expired_cache()
 
 def analyze_stock_highlight_strategy(df: pd.DataFrame):
     """
@@ -1097,7 +1163,20 @@ def analyze_value_factor_strategy(stock_code: str):
 
 
 @app.get("/api/stock/{stock_code}")
-async def get_stock_data(stock_code: str):
+async def get_stock_data(
+    stock_code: str,
+    ma_short: int = 5,
+    ma_long: int = 20,
+    rsi_period: int = 14,
+    rsi_oversold: int = 30,
+    rsi_overbought: int = 70,
+    boll_period: int = 20,
+    boll_std: int = 2,
+    momentum_lookback: int = 20,
+    momentum_percentile: float = 0.8,
+    breakout_period: int = 20,
+    breakout_volume_factor: float = 1.5,
+):
     """
     根据股票代码获取股票日线数据和策略分析结果
     """
@@ -1107,14 +1186,23 @@ async def get_stock_data(stock_code: str):
         end_date = datetime.now().strftime('%Y%m%d')
         start_date = (datetime.now() - timedelta(days=365)).strftime('%Y%m%d')
         
-        stock_zh_a_hist_df = ak.stock_zh_a_hist(symbol=stock_code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+        cached_rows = get_price_cache(stock_code)
+        if cached_rows:
+            stock_zh_a_hist_df = pd.DataFrame(cached_rows)
+        else:
+            stock_zh_a_hist_df = await asyncio.to_thread(ak.stock_zh_a_hist, symbol=stock_code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+            if not stock_zh_a_hist_df.empty:
+                stock_zh_a_hist_df['日期'] = stock_zh_a_hist_df['日期'].astype(str)
+                rows = stock_zh_a_hist_df.to_dict(orient='records')
+                save_price_cache(stock_code, rows, expires_hours=6)
 
         if stock_zh_a_hist_df.empty:
             raise HTTPException(status_code=404, detail="未找到该股票代码的数据")
             
+        stock_zh_a_hist_df['日期'] = stock_zh_a_hist_df['日期'].astype(str)
         # 获取股票名称
-        stock_info = ak.stock_individual_info_em(symbol=stock_code)
-        stock_name = stock_info.value[stock_info['item'] == '股票简称'].iloc[0]
+        stock_info = await asyncio.to_thread(ak.stock_individual_info_em, symbol=stock_code)
+        stock_name = str(stock_info.value[stock_info['item'] == '股票简称'].iloc[0])
 
         # 分析是否需要高亮
         should_highlight = analyze_stock_highlight_strategy(stock_zh_a_hist_df)
@@ -1126,14 +1214,14 @@ async def get_stock_data(stock_code: str):
                 "description": "价格稳定性分析和缩量分析"
             },
             # 趋势跟踪策略
-            "ma_crossover": analyze_ma_crossover_strategy(stock_zh_a_hist_df.copy()),
+            "ma_crossover": analyze_ma_crossover_strategy(stock_zh_a_hist_df.copy(), short_period=ma_short, long_period=ma_long),
             "macd": analyze_macd_strategy(stock_zh_a_hist_df.copy()),
             # 均值回归策略
-            "rsi": analyze_rsi_strategy(stock_zh_a_hist_df.copy()),
-            "bollinger_bands": analyze_bollinger_strategy(stock_zh_a_hist_df.copy()),
+            "rsi": analyze_rsi_strategy(stock_zh_a_hist_df.copy(), period=rsi_period, oversold=rsi_oversold, overbought=rsi_overbought),
+            "bollinger_bands": analyze_bollinger_strategy(stock_zh_a_hist_df.copy(), period=boll_period, std_dev=boll_std),
             # 动量策略
-            "momentum": analyze_momentum_strategy(stock_zh_a_hist_df.copy()),
-            "breakout": analyze_breakout_strategy(stock_zh_a_hist_df.copy()),
+            "momentum": analyze_momentum_strategy(stock_zh_a_hist_df.copy(), lookback_period=momentum_lookback, percentile_threshold=momentum_percentile),
+            "breakout": analyze_breakout_strategy(stock_zh_a_hist_df.copy(), period=breakout_period, volume_factor=breakout_volume_factor),
             # 基本面量化策略
             "peg": analyze_peg_strategy(stock_code),
             "value_factor": analyze_value_factor_strategy(stock_code),
@@ -1142,12 +1230,9 @@ async def get_stock_data(stock_code: str):
 
         }
 
-        # 准备 K 线图数据
-        # ECharts 需要的数据格式是 [日期, 开盘, 收盘, 最低, 最高]
-        k_line_data = stock_zh_a_hist_df[['日期', '开盘', '收盘', '最低', '最高']].values.tolist()
-        
-        # 准备成交量数据
-        volume_data = stock_zh_a_hist_df[['日期', '成交量']].values.tolist()
+        records = stock_zh_a_hist_df[['日期', '开盘', '收盘', '最低', '最高', '成交量']].to_dict(orient='records')
+        k_line_data = [[str(r['日期']), float(r['开盘']), float(r['收盘']), float(r['最低']), float(r['最高'])] for r in records]
+        volume_data = [[str(r['日期']), float(r['成交量'])] for r in records]
 
         # 保存到数据库
         stock_result = {
@@ -1162,13 +1247,26 @@ async def get_stock_data(stock_code: str):
         
         save_stock_to_db(stock_result)
 
-        return stock_result
+        return json.loads(json.dumps(stock_result, ensure_ascii=False, default=str))
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/stock/{stock_code}/strategies")
-async def get_stock_strategies(stock_code: str):
+async def get_stock_strategies(
+    stock_code: str,
+    ma_short: int = 5,
+    ma_long: int = 20,
+    rsi_period: int = 14,
+    rsi_oversold: int = 30,
+    rsi_overbought: int = 70,
+    boll_period: int = 20,
+    boll_std: int = 2,
+    momentum_lookback: int = 20,
+    momentum_percentile: float = 0.8,
+    breakout_period: int = 20,
+    breakout_volume_factor: float = 1.5,
+):
     """
     获取指定股票的所有策略分析结果
     """
@@ -1177,7 +1275,15 @@ async def get_stock_strategies(stock_code: str):
         end_date = datetime.now().strftime('%Y%m%d')
         start_date = (datetime.now() - timedelta(days=365)).strftime('%Y%m%d')
         
-        stock_zh_a_hist_df = ak.stock_zh_a_hist(symbol=stock_code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+        cached_rows = get_price_cache(stock_code)
+        if cached_rows:
+            stock_zh_a_hist_df = pd.DataFrame(cached_rows)
+        else:
+            stock_zh_a_hist_df = await asyncio.to_thread(ak.stock_zh_a_hist, symbol=stock_code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+            if not stock_zh_a_hist_df.empty:
+                stock_zh_a_hist_df['日期'] = stock_zh_a_hist_df['日期'].astype(str)
+                rows = stock_zh_a_hist_df.to_dict(orient='records')
+                save_price_cache(stock_code, rows, expires_hours=6)
 
         if stock_zh_a_hist_df.empty:
             raise HTTPException(status_code=404, detail="未找到该股票代码的数据")
@@ -1189,14 +1295,14 @@ async def get_stock_strategies(stock_code: str):
                 "description": "价格稳定性分析和缩量分析"
             },
             # 趋势跟踪策略
-            "ma_crossover": analyze_ma_crossover_strategy(stock_zh_a_hist_df.copy()),
+            "ma_crossover": analyze_ma_crossover_strategy(stock_zh_a_hist_df.copy(), short_period=ma_short, long_period=ma_long),
             "macd": analyze_macd_strategy(stock_zh_a_hist_df.copy()),
             # 均值回归策略
-            "rsi": analyze_rsi_strategy(stock_zh_a_hist_df.copy()),
-            "bollinger_bands": analyze_bollinger_strategy(stock_zh_a_hist_df.copy()),
+            "rsi": analyze_rsi_strategy(stock_zh_a_hist_df.copy(), period=rsi_period, oversold=rsi_oversold, overbought=rsi_overbought),
+            "bollinger_bands": analyze_bollinger_strategy(stock_zh_a_hist_df.copy(), period=boll_period, std_dev=boll_std),
             # 动量策略
-            "momentum": analyze_momentum_strategy(stock_zh_a_hist_df.copy()),
-            "breakout": analyze_breakout_strategy(stock_zh_a_hist_df.copy()),
+            "momentum": analyze_momentum_strategy(stock_zh_a_hist_df.copy(), lookback_period=momentum_lookback, percentile_threshold=momentum_percentile),
+            "breakout": analyze_breakout_strategy(stock_zh_a_hist_df.copy(), period=breakout_period, volume_factor=breakout_volume_factor),
             # 基本面量化策略
             "peg": analyze_peg_strategy(stock_code),
             "value_factor": analyze_value_factor_strategy(stock_code),
@@ -1204,11 +1310,11 @@ async def get_stock_strategies(stock_code: str):
             "financial_health": analyze_financial_health_strategy(stock_code)
         }
         
-        return {
+        return json.loads(json.dumps({
             "stock_code": stock_code,
             "analysis_time": datetime.now().isoformat(),
             "strategies": strategies_result
-        }
+        }, ensure_ascii=False, default=str))
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1237,6 +1343,14 @@ async def delete_stock(stock_code: str):
             raise HTTPException(status_code=404, detail="股票不存在")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.get("/version")
+async def version():
+    return {"version": "1.0.0"}
 
 def analyze_financial_health_strategy(stock_code: str):
     """
@@ -1364,9 +1478,7 @@ def analyze_financial_health_strategy(stock_code: str):
         }
 
 if __name__ == "__main__":
-    # 初始化数据库
     init_database()
-    # 清理过期缓存
     clean_expired_cache()
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)

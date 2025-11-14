@@ -490,7 +490,7 @@ const addStock = async () => {
   error.value = null;
 
   try {
-    const response = await axios.get(`http://127.0.0.1:8000/api/stock/${stockCode}`);
+    const response = await axios.get(`/api/stock/${stockCode}`);
     stocks.value.push(response.data);
     stockInput.value = ''; // 清空输入框
 
@@ -512,7 +512,7 @@ const addStock = async () => {
 
 const removeStock = async (stockCode) => {
   try {
-    await axios.delete(`http://127.0.0.1:8000/api/stock/${stockCode}`);
+    await axios.delete(`/api/stock/${stockCode}`);
     // 从前端列表中移除
     stocks.value = stocks.value.filter(s => s.stock_code !== stockCode);
     // 销毁图表实例
@@ -527,13 +527,13 @@ const removeStock = async (stockCode) => {
 
 const loadSavedStocks = async () => {
   try {
-    const response = await axios.get('http://127.0.0.1:8000/api/stocks');
+    const response = await axios.get('/api/stocks');
     const savedStocks = response.data.stocks;
     
     for (const savedStock of savedStocks) {
       // 获取最新数据
       try {
-        const stockResponse = await axios.get(`http://127.0.0.1:8000/api/stock/${savedStock.stock_code}`);
+        const stockResponse = await axios.get(`/api/stock/${savedStock.stock_code}`);
         stocks.value.push(stockResponse.data);
         await nextTick();
         renderChart(stockResponse.data);
